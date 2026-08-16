@@ -1,0 +1,5 @@
+# 插件自身的 patch 层（当前未注册进任何 profile，安全）
+# host 端一个 entry；client 端经 exports["./client"] 被 client-runner 自动发现，无需第二个 entry
+- insert:
+    - id: ws-studio
+      name: 'dsh-workspace-studio'
