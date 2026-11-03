@@ -2,8 +2,8 @@
 // 使用 createElement 风格，零 JSX 依赖；组件均为纯函数，便于结构测试。
 
 import * as React from 'react';
-import type { FileEntry, Hunk, OpsPayload, ReadResult, RevertResult, SessionContext } from '../shared/types.ts';
-import { apiAccept, apiClear, apiContext, apiFile, apiOps, apiRevert, apiTree } from './api.ts';
+import type { FileEntry, FileOpsView, Hunk, OpView, OpsPayload, ReadResult, RevertResult, SessionContext } from '../shared/types.ts';
+import { EVENTS_URL, apiAccept, apiAcceptAll, apiClear, apiContext, apiFile, apiOps, apiRevert, apiTree } from './api.ts';
 
 const h = React.createElement;
 
@@ -37,6 +37,82 @@ export function StudioTabLabel(): unknown {
     'Studio',
     count > 0 ? h('span', { className: 'wss-tab-badge' }, String(count)) : null,
   );
+}
+
+// ── 载荷形状校验（契约 §8）：错误包/半截数据不许把视图打崩 ──────────────
+
+/** 文件树必须是 `FileEntry[]`（宿主异常时可能回 `{ok:false,error}` 之类的对象）。 */
+export function isFileEntryArray(value: unknown): value is FileEntry[] {
+  if (!Array.isArray(value)) return false;
+  return value.every((n) => {
+    if (n === null || typeof n !== 'object') return false;
+    const e = n as Partial<FileEntry>;
+    return typeof e.path === 'string' && typeof e.name === 'string';
+  });
+}
+
+/** 改动列表必须是 `{files: FileOpsView[]}`。 */
+export function isOpsPayload(value: unknown): value is OpsPayload {
+  if (value === null || typeof value !== 'object') return false;
+  const files = (value as { files?: unknown }).files;
+  if (!Array.isArray(files)) return false;
+  return files.every((f) => {
+    if (f === null || typeof f !== 'object') return false;
+    const file = f as Partial<FileOpsView>;
+    return typeof file.path === 'string' && Array.isArray(file.ops);
+  });
+}
+
+/**
+ * 操作身份（契约 §3）：撤回/认可按服务端下发的稳定 `id` 定位。
+ * 老服务端还没有 `id` 时返回 null——调用方必须据此报错，不能偷偷退回下标。
+ */
+export function opIdOf(op: { id?: string | null }): string | null {
+  const id = op?.id;
+  return typeof id === 'string' && id !== '' ? id : null;
+}
+
+/** hunk 级动作的目标：`opId` 为空表示服务端没给稳定 id（不能安全撤回）。 */
+export interface HunkTarget {
+  opId: string | null;
+  /** 台账下标，仅供展示/排错，不参与请求体 */
+  opIndex: number;
+}
+
+/**
+ * 过期响应守卫（契约 §8）：每次发起请求取一个自增序号，响应回来时序号不是最新就丢弃；
+ * 切文件/切会话时 `invalidate()` 让所有在途响应作废。
+ * 抽成纯对象是为了能单测（组件里的 effect 在测试桩下不执行）。
+ */
+export interface SeqGuard {
+  /** 取一个新的序号（同时让此前所有序号失效） */
+  next(): number;
+  /** 当前序号（用于"只刷新不抢序号"的场景） */
+  current(): number;
+  /** 当前是否仍是最新序号 */
+  isCurrent(seq: number): boolean;
+  /** 让所有在途请求作废（切会话） */
+  invalidate(): void;
+}
+
+export function createSeqGuard(ref: { current: number }): SeqGuard {
+  return {
+    next: () => (ref.current += 1),
+    current: () => ref.current,
+    isCurrent: (seq: number) => seq === ref.current,
+    invalidate: () => {
+      ref.current += 1;
+    },
+  };
+}
+
+function hunkListOf(op: OpView): Hunk[] {
+  return Array.isArray(op.hunks) ? op.hunks : [];
+}
+
+function resolvedHunksOf(op: OpView, key: 'revertedHunks' | 'acceptedHunks'): number[] {
+  const v = op[key];
+  return Array.isArray(v) ? v.filter((x) => typeof x === 'number') : [];
 }
 
 export interface DiffRow {
@@ -168,6 +244,14 @@ export function FileTree(props: {
   changedPaths?: string[];
   onSelect: (path: string) => void;
 }): unknown {
+  // 契约 §8：先校验形状。宿主回错误包时 `props.tree` 不是数组，
+  // 直接 `.filter` 会把整个标签页渲染成空白。
+  if (!isFileEntryArray(props.tree)) {
+    return h('div', { className: 'wss-empty' }, '文件树数据格式异常，点 ↻ 重试');
+  }
+  if (props.tree.length === 0) {
+    return h('div', { className: 'wss-empty' }, '工作区里没有可显示的文件');
+  }
   // 防御性归一化：与树节点路径（服务端已归一化为正斜杠）保持一致
   const changed = new Set((props.changedPaths ?? []).map((p) => p.replace(/\\/g, '/')));
   // 初始展开：第一层目录 + 包含已修改文件的祖先目录
@@ -243,19 +327,39 @@ export function CodeViewer(props: {
 export function DiffPanel(props: {
   ops: OpsPayload | null;
   busy: boolean;
-  onRevertHunk: (opIndex: number, hunkIndex: number) => void;
-  onAcceptHunk: (opIndex: number, hunkIndex: number) => void;
+  /** 块级动作按 `opId` 定位（契约 §3）；`opId` 为 null 时仍回调，由上层拒绝并报错 */
+  onRevertHunk: (target: HunkTarget, hunkIndex: number) => void;
+  onAcceptHunk: (target: HunkTarget, hunkIndex: number) => void;
   onRevertFile: () => void;
+  /** 一键同意：认可该文件全部待处理变更块 */
+  onAcceptAll: () => void;
 }): unknown {
-  if (!props.ops || props.ops.files.length === 0) {
+  // 契约 §8：形状校验——`ops?.files?.length` 不成立时走空态，不让错误包打崩面板
+  if (!props.ops || !isOpsPayload(props.ops) || props.ops.files.length === 0) {
     return h('div', { className: 'wss-empty' }, '暂无改动记录（本会话内 write/edit 过的文件会出现在这里）');
   }
   const file = props.ops.files[0];
+  const pendingHunks = file.ops.reduce((n, op) => {
+    const reverted = resolvedHunksOf(op, 'revertedHunks');
+    const accepted = resolvedHunksOf(op, 'acceptedHunks');
+    return n + hunkListOf(op).filter((_, hi) => !reverted.includes(hi) && !accepted.includes(hi)).length;
+  }, 0);
   const sections: unknown[] = [
     h(
       'div',
       { className: 'wss-diff-head' },
       h('span', { className: 'wss-path', title: file.path }, file.path),
+      h(
+        'button',
+        {
+          type: 'button',
+          className: 'wss-btn wss-btn-accept',
+          disabled: props.busy || pendingHunks === 0,
+          onClick: props.onAcceptAll,
+          title: '认可该文件的全部待处理变更块',
+        },
+        pendingHunks > 0 ? `一键同意（${pendingHunks} 块）` : '一键同意',
+      ),
       h(
         'button',
         { type: 'button', className: 'wss-btn wss-btn-danger', disabled: props.busy, onClick: props.onRevertFile },
@@ -264,22 +368,28 @@ export function DiffPanel(props: {
     ),
   ];
   for (const op of file.ops) {
+    const hunks = hunkListOf(op);
+    const revertedHunks = resolvedHunksOf(op, 'revertedHunks');
+    const acceptedHunks = resolvedHunksOf(op, 'acceptedHunks');
+    const target: HunkTarget = { opId: opIdOf(op), opIndex: typeof op.index === 'number' ? op.index : 0 };
     const opParts: unknown[] = [
       h(
         'div',
         { className: 'wss-op-head' },
-        h('span', { className: 'wss-op-title' }, `操作 ${op.index + 1}`),
-        h('span', { className: 'wss-op-meta' }, op.turn != null ? `轮次 ${op.turn} · ` : '', `+${op.added} −${op.removed}`),
+        h('span', { className: 'wss-op-title' }, `操作 ${target.opIndex + 1}`),
+        h('span', { className: 'wss-op-meta' }, op.turn != null ? `轮次 ${op.turn} · ` : '', `+${op.added ?? 0} −${op.removed ?? 0}`),
+        // 契约 §7：占位记录（快照过大被截断）要显式说明，别让用户以为是空文件
+        op.truncated ? h('span', { className: 'wss-hint' }, '快照过大，不可撤回') : null,
       ),
     ];
-    op.hunks.forEach((hunk, hi) => {
-      const reverted = op.revertedHunks.includes(hi);
-      const accepted = op.acceptedHunks.includes(hi);
+    hunks.forEach((hunk, hi) => {
+      const reverted = revertedHunks.includes(hi);
+      const accepted = acceptedHunks.includes(hi);
       const resolved = reverted || accepted;
       const head = h(
         'div',
         { className: 'wss-hunk-head' },
-        h('span', { className: 'wss-hunk-title' }, `变更块 ${hi + 1}/${op.hunks.length}`),
+        h('span', { className: 'wss-hunk-title' }, `变更块 ${hi + 1}/${hunks.length}`),
         reverted
           ? h('span', { className: 'wss-hunk-done' }, '已撤回')
           : accepted
@@ -292,7 +402,7 @@ export function DiffPanel(props: {
             type: 'button',
             className: 'wss-btn wss-btn-accept',
             disabled: props.busy || !op.revertible,
-            onClick: () => props.onAcceptHunk(op.index, hi),
+            onClick: () => props.onAcceptHunk(target, hi),
           },
           '认可',
         ),
@@ -302,7 +412,7 @@ export function DiffPanel(props: {
             type: 'button',
             className: 'wss-btn',
             disabled: props.busy || !op.revertible,
-            onClick: () => props.onRevertHunk(op.index, hi),
+            onClick: () => props.onRevertHunk(target, hi),
           },
           '撤回此块',
         ),
@@ -324,7 +434,7 @@ export function DiffPanel(props: {
         ),
       );
     });
-    sections.push(h('div', { key: op.index, className: 'wss-op' }, ...opParts));
+    sections.push(h('div', { key: target.opIndex, className: 'wss-op' }, ...opParts));
   }
   return h('div', { className: 'wss-diff' }, ...sections);
 }
@@ -333,8 +443,10 @@ function confirmDialog(msg: string): boolean {
   return typeof window !== 'undefined' ? window.confirm(msg) : true;
 }
 
-function alertDialog(msg: string): void {
-  if (typeof window !== 'undefined') window.alert(msg);
+/** 统一取错误文案：ApiError / Error / 其它。 */
+function errorText(e: unknown): string {
+  const msg = (e as Error)?.message;
+  return String(msg ?? e);
 }
 
 /** Studio 主视图：文件树 + 查看器 + 改动面板。 */
@@ -342,9 +454,12 @@ export function StudioView(props: { sessionId?: string }): unknown {
   const sessionId = props.sessionId ?? '';
   const [root, setRoot] = React.useState<string | null>(null);
   const [tree, setTree] = React.useState<FileEntry[] | null>(null);
+  const [treeError, setTreeError] = React.useState<string | null>(null);
   const [selected, setSelected] = React.useState<string | null>(null);
   const [content, setContent] = React.useState<ReadResult | null>(null);
+  const [fileError, setFileError] = React.useState<string | null>(null);
   const [ops, setOps] = React.useState<OpsPayload | null>(null);
+  const [opsError, setOpsError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -353,112 +468,285 @@ export function StudioView(props: { sessionId?: string }): unknown {
 
   React.useEffect(() => subscribeChanges(() => setChangedPathsLocal([...changeStore.paths])), []);
 
+  // 过期响应丢弃（契约 §8）：
+  // - `treeGuard` / `selGuard` 是各自请求链的自增序号，回来的响应序号不是最新就丢掉；
+  // - 切会话时两者一起 `invalidate()`，上一个会话的迟到响应一律作废。
+  const treeGuard = createSeqGuard(React.useRef(0));
+  const selGuard = createSeqGuard(React.useRef(0));
+
   const loadTree = (r: string) => {
+    const seq = treeGuard.next();
     apiTree(r)
-      .then(setTree)
-      .catch((e: unknown) => setError(String((e as Error)?.message ?? e)));
+      .then((t) => {
+        if (!treeGuard.isCurrent(seq)) return;
+        if (!isFileEntryArray(t)) {
+          setTree(null);
+          setTreeError('文件树数据格式异常');
+          return;
+        }
+        setTree(t);
+        setTreeError(null);
+      })
+      .catch((e: unknown) => {
+        if (!treeGuard.isCurrent(seq)) return;
+        setTree(null);
+        setTreeError(errorText(e));
+      });
   };
+
   const loadSelected = (p: string) => {
-    apiFile(p).then(setContent).catch(() => setContent(null));
-    if (sessionId) apiOps(sessionId, p).then(setOps).catch(() => setOps(null));
+    const seq = selGuard.next();
+    setContent(null);
+    setFileError(null);
+    setOps(null);
+    setOpsError(null);
+    apiFile(p)
+      .then((r) => {
+        if (!selGuard.isCurrent(seq)) return;
+        setContent(r);
+      })
+      .catch((e: unknown) => {
+        if (!selGuard.isCurrent(seq)) return;
+        setContent(null);
+        setFileError(errorText(e));
+      });
+    if (!sessionId) return;
+    apiOps(sessionId, p)
+      .then((r) => {
+        if (!selGuard.isCurrent(seq)) return;
+        if (!isOpsPayload(r)) {
+          setOps(null);
+          setOpsError('改动记录数据格式异常');
+          return;
+        }
+        setOps(r);
+        setOpsError(null);
+      })
+      .catch((e: unknown) => {
+        if (!selGuard.isCurrent(seq)) return;
+        setOps(null);
+        setOpsError(errorText(e));
+      });
   };
+
+  /** 只刷新改动的 ops：沿用当前选择序号（不 next），避免把在途的内容加载挤掉。 */
   const refreshOps = () => {
-    if (sessionId && selected) apiOps(sessionId, selected).then(setOps).catch(() => setOps(null));
+    if (!sessionId || !selected) return;
+    const seq = selGuard.current();
+    apiOps(sessionId, selected)
+      .then((r) => {
+        if (!selGuard.isCurrent(seq)) return;
+        if (!isOpsPayload(r)) {
+          setOps(null);
+          setOpsError('改动记录数据格式异常');
+          return;
+        }
+        setOps(r);
+        setOpsError(null);
+      })
+      .catch((e: unknown) => {
+        if (!selGuard.isCurrent(seq)) return;
+        setOps(null);
+        setOpsError(errorText(e));
+      });
   };
+
   const refreshChanged = () => {
     if (!sessionId) return;
     apiOps(sessionId)
-      .then((p) => setChangedPaths(p.files.map((f) => f.path)))
-      .catch(() => {});
+      .then((p) => setChangedPaths(isOpsPayload(p) ? p.files.map((f) => f.path) : []))
+      .catch(() => {
+        // 角标/树标记是辅助信息：取不到就保持现状，不打断主流程
+      });
   };
 
+  /** 会话上下文 → 默认文件树根。与树加载共用序号：后发起的加载作废先前的。 */
+  const loadContext = () => {
+    if (!sessionId) return;
+    const seq = treeGuard.next();
+    apiContext(sessionId)
+      .then((c: SessionContext) => {
+        if (!treeGuard.isCurrent(seq)) return;
+        const cwd = typeof c?.cwd === 'string' && c.cwd !== '' ? c.cwd : null;
+        if (cwd) {
+          setRoot(cwd);
+          loadTree(cwd);
+        } else {
+          setRoot(null);
+          setTree(null);
+          setTreeError('未取到该会话的工作目录，请先打开一个工作区');
+        }
+      })
+      .catch((e: unknown) => {
+        if (!treeGuard.isCurrent(seq)) return;
+        setTreeError(`会话上下文读取失败：${errorText(e)}`);
+      });
+  };
+
+  // SSE 订阅只随 sessionId 建立一次；刷新函数通过 ref 取最新版，
+  // 避免"点一个文件就重连一次 EventSource"（服务端 clients 集合会来回抖动）。
+  const refreshRef = React.useRef<() => void>(() => {});
+  refreshRef.current = () => {
+    refreshOps();
+    refreshChanged();
+  };
+
+  // 切会话（契约 §8）：先把上一个会话的状态**全部**清掉，再加载新的会话。
+  // 否则切换瞬间会看到别的会话的文件树、diff、提示和错误。
   React.useEffect(() => {
-    let alive = true;
-    if (sessionId) {
-      apiContext(sessionId)
-        .then((c: SessionContext) => {
-          if (alive && c.cwd) {
-            setRoot(c.cwd);
-            loadTree(c.cwd);
-          }
-        })
-        .catch(() => {});
-      refreshChanged();
-    }
-    return () => {
-      alive = false;
-    };
+    // 作废上一个会话所有在途请求
+    treeGuard.invalidate();
+    selGuard.invalidate();
+    setRoot(null);
+    setTree(null);
+    setTreeError(null);
+    setSelected(null);
+    setContent(null);
+    setFileError(null);
+    setOps(null);
+    setOpsError(null);
+    setBusy(false);
+    setNotice(null);
+    setError(null);
+    setChangedPaths([]);
+    setChangedPathsLocal([]);
+    if (!sessionId) return undefined;
+
+    // 用序号守卫代替 alive：切会话时守卫已 invalidate，上一个会话的响应自然被丢弃
+    loadContext();
+    refreshChanged();
+    return undefined;
   }, [sessionId]);
 
   React.useEffect(() => {
-    if (!sessionId) return;
-    const es = new EventSource('/ws-studio/events');
-    es.onmessage = (e: MessageEvent) => {
-      try {
-        const d = JSON.parse(String(e.data)) as { session?: string };
-        if (d && d.session === sessionId) {
-          refreshOps();
-          refreshChanged();
-        }
-      } catch {
-        // 忽略非 JSON 帧
-      }
+    if (!sessionId) return undefined;
+    // 无 EventSource（SSR/老浏览器）时安静降级，不让整个视图渲染失败
+    if (typeof EventSource === 'undefined') return undefined;
+    const es = new EventSource(EVENTS_URL);
+    // 契约 §8：载荷只表示"有变化"（不再带 session），客户端据此刷新当前会话
+    es.onmessage = () => {
+      refreshRef.current();
     };
     return () => es.close();
-  }, [sessionId, selected]);
+  }, [sessionId]);
 
   const selectFile = (p: string) => {
     setSelected(p);
-    setContent(null);
-    setOps(null);
+    setNotice(null);
+    setError(null);
     loadSelected(p);
   };
 
-  const doRevert = (msg: string, call: Promise<RevertResult>, after: () => void) => {
+  /** 手动刷新：树 + 当前文件 + 改动角标（错误态下的重试入口）。 */
+  const reload = () => {
+    setError(null);
+    setNotice(null);
+    setTreeError(null);
+    setFileError(null);
+    setOpsError(null);
+    if (sessionId) {
+      if (root) loadTree(root);
+      else loadContext();
+    }
+    if (selected) loadSelected(selected);
+    refreshChanged();
+  };
+
+  /** 写操作统一包装：先确认，再发请求（不确认就不发），失败写 error 状态。 */
+  const doAction = (msg: string, run: () => Promise<RevertResult>, after: () => void) => {
     if (!confirmDialog(msg)) return;
     setBusy(true);
-    call
+    setError(null);
+    setNotice(null);
+    let pending: Promise<RevertResult>;
+    try {
+      pending = run();
+    } catch (e) {
+      setBusy(false);
+      setError(`操作失败：${errorText(e)}`);
+      return;
+    }
+    pending
       .then((v) => {
-        if (v.ok) {
+        if (v && v.ok) {
           setNotice(v.message);
           after();
         } else {
-          alertDialog(`撤回失败：${v.error}`);
+          setError(`操作失败：${(v as { error?: string })?.error ?? '未知错误'}`);
         }
       })
-      .catch((e: unknown) => alertDialog(`撤回失败：${String((e as Error)?.message ?? e)}`))
+      .catch((e: unknown) => setError(`操作失败：${errorText(e)}`))
       .finally(() => setBusy(false));
   };
 
-  const revertHunk = (opIndex: number, hunkIndex: number) => {
+  const revertHunk = (target: HunkTarget, hunkIndex: number) => {
     if (!sessionId || !selected) return;
-    doRevert('确定撤回这个变更块？此操作会直接改写磁盘上的文件。', apiRevert(sessionId, selected, opIndex, hunkIndex), () => {
-      if (selected) loadSelected(selected);
-      refreshChanged();
-    });
+    const path = selected;
+    doAction(
+      '确定撤回这个变更块？此操作会直接改写磁盘上的文件。',
+      () => apiRevert(sessionId, path, target.opId, hunkIndex),
+      () => {
+        loadSelected(path);
+        refreshChanged();
+      },
+    );
   };
 
-  const acceptHunk = (opIndex: number, hunkIndex: number) => {
+  const acceptHunk = (target: HunkTarget, hunkIndex: number) => {
     if (!sessionId || !selected) return;
-    doRevert(`确定认可这个变更块？认可后不再标记、不再显示差异。`, apiAccept(sessionId, selected, opIndex, hunkIndex), () => {
-      if (selected) loadSelected(selected);
-      refreshChanged();
-    });
+    const path = selected;
+    const opId = target.opId;
+    if (!opId) {
+      setError('该操作记录缺少 opId（服务端未下发），请点 ↻ 刷新后重试');
+      return;
+    }
+    doAction(
+      '确定认可这个变更块？认可后不再标记、不再显示差异。',
+      () => apiAccept(sessionId, path, opId, hunkIndex),
+      () => {
+        loadSelected(path);
+        refreshChanged();
+      },
+    );
   };
 
   const revertFile = () => {
     if (!sessionId || !selected) return;
-    doRevert('确定撤回该文件的全部修改？此操作会直接改写磁盘上的文件。', apiRevert(sessionId, selected), () => {
-      if (selected) loadSelected(selected);
-      refreshChanged();
-    });
+    const path = selected;
+    doAction(
+      '确定撤回该文件的全部修改？此操作会直接改写磁盘上的文件。',
+      () => apiRevert(sessionId, path),
+      () => {
+        loadSelected(path);
+        refreshChanged();
+      },
+    );
+  };
+
+  /** 一键同意：把该文件所有待处理变更块标记为认可（不写盘）。 */
+  const acceptAll = () => {
+    if (!sessionId || !selected) return;
+    const path = selected;
+    doAction(
+      '确定认可该文件的全部待处理变更块？认可后不再标记、不再显示差异。',
+      () => apiAcceptAll(sessionId, path),
+      () => {
+        loadSelected(path);
+        refreshChanged();
+      },
+    );
   };
 
   const clearAll = () => {
     if (!sessionId || !confirmDialog('清空本会话的改动记录？')) return;
     apiClear(sessionId)
-      .then(() => setOps(null))
-      .catch(() => {});
+      .then(() => {
+        setOps(null);
+        setOpsError(null);
+        setNotice('已清空本会话的改动记录');
+        refreshChanged();
+      })
+      .catch((e: unknown) => setError(`清空失败：${errorText(e)}`));
   };
 
   return h(
@@ -472,7 +760,7 @@ export function StudioView(props: { sessionId?: string }): unknown {
       h('span', { className: 'wss-spacer' }),
       notice ? h('span', { className: 'wss-notice' }, notice) : null,
       error ? h('span', { className: 'wss-error' }, error) : null,
-      h('button', { type: 'button', className: 'wss-btn', title: '刷新', onClick: () => root && loadTree(root) }, '↻'),
+      h('button', { type: 'button', className: 'wss-btn', title: '刷新', onClick: reload }, '↻'),
       h('button', { type: 'button', className: 'wss-btn', title: '清空记录', onClick: clearAll }, '清空'),
     ),
     h(
@@ -481,14 +769,11 @@ export function StudioView(props: { sessionId?: string }): unknown {
       h(
         'div',
         { className: 'wss-pane wss-pane-tree' },
-        tree
-          ? h(FileTree, {
-              tree,
-              selected,
-              changedPaths,
-              onSelect: selectFile,
-            })
-          : h('div', { className: 'wss-empty' }, '加载中…'),
+        treeError
+          ? h('div', { className: 'wss-empty' }, `文件树加载失败：${treeError}（点 ↻ 重试）`)
+          : tree
+            ? h(FileTree, { tree, selected, changedPaths, onSelect: selectFile })
+            : h('div', { className: 'wss-empty' }, '加载中…'),
       ),
       h(
         'div',
@@ -500,8 +785,12 @@ export function StudioView(props: { sessionId?: string }): unknown {
               truncated: content.ok ? content.truncated : false,
               error: content.ok ? null : content.error,
             })
-          : h('div', { className: 'wss-empty' }, '点击左侧文件查看内容'),
-        h(DiffPanel, { ops, busy, onRevertHunk: revertHunk, onAcceptHunk: acceptHunk, onRevertFile: revertFile }),
+          : fileError
+            ? h('div', { className: 'wss-empty' }, `文件加载失败：${fileError}`)
+            : h('div', { className: 'wss-empty' }, '点击左侧文件查看内容'),
+        opsError
+          ? h('div', { className: 'wss-empty' }, `改动记录加载失败：${opsError}（点 ↻ 重试）`)
+          : h(DiffPanel, { ops, busy, onRevertHunk: revertHunk, onAcceptHunk: acceptHunk, onRevertFile: revertFile, onAcceptAll: acceptAll }),
       ),
     ),
   );

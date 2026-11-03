@@ -1,7 +1,7 @@
 {
   "name": "dsh-workspace-studio",
-  "version": "0.1.0",
-  "description": "DeepSeek Harness plugin: workspace file browser + code viewer + session change diff + hunk-level partial revert (Trae-style). Windows verified.",
+  "version": "0.3.0",
+  "description": "DeepSeek Harness plugin: workspace file browser + code viewer + session change diff + hunk-level partial revert (Trae-style). Verified on the desktop app (0.2.1-rc.5) and the Web UI.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/houlain/dsh-workspace-studio.git"
@@ -13,7 +13,8 @@
     "dsh-plugin",
     "workspace",
     "diff",
-    "revert"
+    "revert",
+    "desktop"
   ],
   "type": "module",
   "main": "lib/index.js",
@@ -29,7 +30,6 @@
     },
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-ui-conversation",
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-ui-sidebar"
@@ -43,10 +43,18 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --test --test-isolation=none \"tests/*.test.ts\""
+    "test": "node --import ./tests/react-stub/register.mjs --test --test-isolation=none \"tests/*.test.ts\""
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.1",
+    "react": "^18.2.0"
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.5"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.25.0",
+    "react": "^18.3.1"
   },
   "license": "MIT"
 }

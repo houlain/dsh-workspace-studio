@@ -58,14 +58,24 @@ class MemFs implements FsLike {
     this.nodes.set(target.targetKey, { type: 'file', content });
     return { version: 2 };
   }
-  async unlink(target: FsTargetLike): Promise<unknown> {
+  async remove(target: FsTargetLike): Promise<unknown> {
     if (!this.nodes.delete(target.targetKey)) throw new Error(`ENOENT: ${target.targetKey}`);
     return undefined;
+  }
+  async unlink(target: FsTargetLike): Promise<unknown> {
+    return this.remove(target);
   }
 }
 
 function makeService(fs: MemFs, ledger = new ChangeLedger()) {
-  return new WsStudioService({ ledger, fs, maxReadBytes: 100 });
+  return new WsStudioService({
+    ledger,
+    fs,
+    maxReadBytes: 100,
+    // 写路径授权与沙箱策略是 host 层的事；这里单测撤回逻辑本身，两个钩子都给"允许"
+    sessionCwd: () => '/work',
+    isWriteAllowed: () => true,
+  });
 }
 
 const SESSION = 's1';
@@ -79,7 +89,8 @@ function addEditOp(
   sessionId = SESSION,
   turn: number | null = 1,
 ) {
-  ledger.add({ sessionId, filePath, before, after, turn });
+  // 返回记录本身：撤回/认可按稳定 id 定位（契约 §3），不能再传台下标
+  return ledger.add({ sessionId, filePath, before, after, turn });
 }
 
 test('service.tree: 经 ctx.fs 构建文件树', async () => {
@@ -147,11 +158,11 @@ test('service.revertHunk: 成功撤回并写回文件、标记台账、触发通
   const fs = new MemFs();
   fs.addFile(FILE, 'a\nX\nb\nc');
   const ledger = new ChangeLedger();
-  addEditOp(ledger, 'a\nb\nc', 'a\nX\nb\nc');
+  const op0 = addEditOp(ledger, 'a\nb\nc', 'a\nX\nb\nc');
   const s = makeService(fs, ledger);
   let notified = '';
   s.onChanged((sid) => (notified = sid));
-  const r = await s.revertHunk(SESSION, FILE, 0, 0);
+  const r = await s.revertHunk(SESSION, FILE, op0.id, 0);
   assert.equal(r.ok, true);
   assert.equal(fs.contentOf(FILE), 'a\nb\nc');
   assert.equal(notified, SESSION);
@@ -163,9 +174,9 @@ test('service.revertHunk: 冲突（区域已被后续修改）→ 拒绝且文�
   const fs = new MemFs();
   fs.addFile(FILE, 'a\nY\nb\nc'); // X 被后续改成了 Y
   const ledger = new ChangeLedger();
-  addEditOp(ledger, 'a\nb\nc', 'a\nX\nb\nc');
+  const op0 = addEditOp(ledger, 'a\nb\nc', 'a\nX\nb\nc');
   const s = makeService(fs, ledger);
-  const r = await s.revertHunk(SESSION, FILE, 0, 0);
+  const r = await s.revertHunk(SESSION, FILE, op0.id, 0);
   assert.equal(r.ok, false);
   assert.equal(fs.contentOf(FILE), 'a\nY\nb\nc');
 });
@@ -182,15 +193,28 @@ test('service.revertFile: 恢复首次操作前内容并清空记录', async () 
   assert.equal(ledger.all().length, 0);
 });
 
-test('service.revertFile: 会话中新建的文件 → 删除', async () => {
+test('service.revertFile: 会话中新建的文件（created=true）→ 删除', async () => {
   const fs = new MemFs();
   fs.addFile(FILE, 'new content');
   const ledger = new ChangeLedger();
-  ledger.add({ sessionId: SESSION, filePath: FILE, before: null, after: 'new content', turn: 1 });
+  ledger.add({ sessionId: SESSION, filePath: FILE, before: null, after: 'new content', created: true, turn: 1 });
   const s = makeService(fs, ledger);
   const r = await s.revertFile(SESSION, FILE);
   assert.equal(r.ok, true);
   assert.equal(fs.exists(FILE), false);
+});
+
+test('service.revertFile: write 的 before=null 但不是 create → 拒绝删除（不得误删原文件）', async () => {
+  const fs = new MemFs();
+  fs.addFile(FILE, 'overwritten');
+  const ledger = new ChangeLedger();
+  // operation:'update' 且无基线 → created 不为 true
+  ledger.add({ sessionId: SESSION, filePath: FILE, before: null, after: 'overwritten', created: false, turn: 1 });
+  const s = makeService(fs, ledger);
+  const r = await s.revertFile(SESSION, FILE);
+  assert.equal(r.ok, false);
+  assert.match(r.error ?? '', /基线/);
+  assert.equal(fs.exists(FILE), true, '原文件必须还在');
 });
 
 test('service.clearSession: 清空并通知', () => {
@@ -222,9 +246,9 @@ test('service.revertHunk: 正斜杠路径命中反斜杠台账并成功撤回', 
   const fs = new MemFs();
   fs.addFile('E:/work/main.cpp', 'a\nX\nb');
   const ledger = new ChangeLedger();
-  ledger.add({ sessionId: SESSION, filePath: 'E:\\work\\main.cpp', before: 'a\nb', after: 'a\nX\nb', turn: 1 });
+  const op0 = ledger.add({ sessionId: SESSION, filePath: 'E:\\work\\main.cpp', before: 'a\nb', after: 'a\nX\nb', turn: 1 });
   const s = makeService(fs, ledger);
-  const r = await s.revertHunk(SESSION, 'E:/work/main.cpp', 0, 0);
+  const r = await s.revertHunk(SESSION, 'E:/work/main.cpp', op0.id, 0);
   assert.equal(r.ok, true);
   assert.equal(fs.contentOf('E:/work/main.cpp'), 'a\nb');
 });
@@ -233,14 +257,15 @@ test('service.revertHunk: 撤回写入携带会话级沙箱策略（workspace-wr
   const fs = new MemFs();
   fs.addFile(FILE, 'a\nX\nb');
   const ledger = new ChangeLedger();
-  addEditOp(ledger, 'a\nb', 'a\nX\nb');
+  const op0 = addEditOp(ledger, 'a\nb', 'a\nX\nb');
   const s = new WsStudioService({
     ledger,
     fs,
     sessionCwd: (sid) => (sid === SESSION ? '/work' : undefined),
+    isWriteAllowed: () => true,
     maxReadBytes: 100,
   });
-  const r = await s.revertHunk(SESSION, FILE, 0, 0);
+  const r = await s.revertHunk(SESSION, FILE, op0.id, 0);
   assert.equal(r.ok, true);
   assert.deepEqual(fs.lastPolicy, { mode: 'workspace-write', workspaceRoot: '/work' });
 });
@@ -260,20 +285,20 @@ test('service.revertFile: 正斜杠路径整文件撤回并清空该文件记录
 // ── 认可（accept）与 pending 语义 ────────────────────────────────────
 test('service.acceptHunk: 认可成功、重复认可拒绝、已撤回的拒绝', async () => {
   const ledger = new ChangeLedger();
-  addEditOp(ledger, 'a\nb', 'a\nX\nb');
+  const op0 = addEditOp(ledger, 'a\nb', 'a\nX\nb');
   const s = makeService(new MemFs(), ledger);
   let notified = '';
   s.onChanged((sid) => (notified = sid));
 
-  const r1 = await s.acceptHunk(SESSION, FILE, 0, 0);
+  const r1 = await s.acceptHunk(SESSION, FILE, op0.id, 0);
   assert.equal(r1.ok, true);
   assert.deepEqual(ledger.all()[0].acceptedHunks, [0]);
   assert.equal(notified, SESSION);
 
-  const r2 = await s.acceptHunk(SESSION, FILE, 0, 0);
+  const r2 = await s.acceptHunk(SESSION, FILE, op0.id, 0);
   assert.equal(r2.ok, false); // 重复认可
 
-  const r3 = await s.acceptHunk(SESSION, FILE, 0, 5);
+  const r3 = await s.acceptHunk(SESSION, FILE, op0.id, 5);
   assert.equal(r3.ok, false); // 越界 hunk 索引
 });
 
@@ -283,7 +308,6 @@ test('service.opsFor: 全部处理完的文件不再出现在列表视图，但�
   const s = makeService(new MemFs(), ledger);
   assert.equal(s.opsFor(SESSION).files.length, 1);
   assert.equal(s.opsFor(SESSION).files[0].pending, true);
-
   // 认可唯一 hunk → 列表视图排除该文件；指定文件时仍返回且 pending=false
   const opId = ledger.all()[0].id;
   ledger.markHunkAccepted(opId, 0);
@@ -292,4 +316,46 @@ test('service.opsFor: 全部处理完的文件不再出现在列表视图，但�
   assert.equal(detail.files.length, 1);
   assert.equal(detail.files[0].pending, false);
   assert.deepEqual(detail.files[0].ops[0].acceptedHunks, [0]);
+});
+
+test('service.acceptAllHunks: 一键同意——把所有待处理变更块一次认可', async () => {
+  const fs = new MemFs();
+  fs.addFile(FILE, 'a\nX\nb\nY\nc');
+  const ledger = new ChangeLedger();
+  addEditOp(ledger, 'a\nb\nc', 'a\nX\nb\nY\nc'); // 2 个 hunk
+  const s = makeService(fs, ledger);
+
+  assert.equal(s.opsFor(SESSION).files[0].pending, true);
+  const r = await s.acceptAllHunks(SESSION, FILE);
+  assert.equal(r.ok, true);
+  assert.match(r.message ?? '', /已认可 \d+ 个变更块/);
+
+  const left = s.opsFor(SESSION);
+  assert.equal(left.files.length, 0, '全部认可后列表视图不再显示该文件');
+  const detail = s.opsFor(SESSION, FILE);
+  const pending = detail.files[0].ops.reduce(
+    (n, op) => n + op.hunks.filter((_, i) => !op.acceptedHunks.includes(i) && !op.revertedHunks.includes(i)).length,
+    0,
+  );
+  assert.equal(pending, 0, '不应再有待处理变更块');
+
+  const again = await s.acceptAllHunks(SESSION, FILE);
+  assert.equal(again.ok, false, '没有待处理块时应返回失败');
+});
+
+test('service.revertFile: 历史被容量裁剪后拒绝删除（防基线漂移误删会话前文件）', async () => {
+  const fs = new MemFs();
+  fs.addFile(FILE, 'v3');
+  // 只留 2 条/文件：三条写入后最旧的一条（唯一记着 orig 的）被裁掉
+  const ledger = new ChangeLedger({ maxOpsPerFile: 2, maxOpsTotal: 100, maxOpBytes: 120 * 1024 });
+  ledger.add({ sessionId: SESSION, filePath: FILE, before: 'orig', after: 'v1', created: false, turn: 1 });
+  ledger.add({ sessionId: SESSION, filePath: FILE, before: null, after: 'v2', created: true, turn: 1 });
+  ledger.add({ sessionId: SESSION, filePath: FILE, before: 'v2', after: 'v3', created: false, turn: 1 });
+  assert.equal(ledger.wasPruned(FILE), true, '裁剪后必须标记该文件');
+
+  const s = makeService(fs, ledger);
+  const r = await s.revertFile(SESSION, FILE);
+  assert.equal(r.ok, false, '历史被裁剪时不得删除');
+  assert.match(r.error ?? '', /裁剪/);
+  assert.equal(fs.exists(FILE), true, '会话前已存在的文件必须还在');
 });

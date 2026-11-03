@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { ChangeLedger } from '../src/core/ledger.ts';
 import { WsStudioService } from '../src/host/service.ts';
 import { registerRoutes } from '../src/host/routes.ts';
+import { isPathInsideWorkspace } from '../src/host/security.ts';
 import type { FsLike, FsTargetLike, FsInfoLike, FsDirEntryLike, ReqLike, ResLike } from '../src/host/types.ts';
 
 class MemFs implements FsLike {
@@ -42,6 +43,10 @@ class MemFs implements FsLike {
     this.nodes.set(t.targetKey, { type: 'file', content });
     return { version: 2 };
   }
+  async remove(t: FsTargetLike): Promise<unknown> {
+    this.nodes.delete(t.targetKey);
+    return undefined;
+  }
   async unlink(t: FsTargetLike): Promise<unknown> {
     this.nodes.delete(t.targetKey);
     return undefined;
@@ -57,9 +62,18 @@ interface Route {
 function makeHarness() {
   const fs = new MemFs();
   const ledger = new ChangeLedger();
-  const service = new WsStudioService({ ledger, fs, maxReadBytes: 1000 });
+  const service = new WsStudioService({
+    ledger,
+    fs,
+    maxReadBytes: 1000,
+    sessionCwd: () => '/work',
+    isWriteAllowed: (p) => isPathInsideWorkspace(p, ['/work']),
+  });
   const routes: Route[] = [];
-  registerRoutes(service, { register: (r) => routes.push(r as Route) });
+  registerRoutes(service, { register: (r) => routes.push(r as Route) }, {
+    workspaceRoots: () => ['/work'],
+    sessionCwd: () => '/work',
+  });
   const byPath = new Map(routes.map((r) => [r.path, r.handler]));
   return { fs, ledger, service, byPath };
 }
@@ -90,8 +104,21 @@ function makeRes(): ResLike & { body: string; headers: Record<string, string> } 
   return res;
 }
 
-function makeReq(url: string, body?: unknown): ReqLike {
-  const req: ReqLike = { url };
+function makeReq(
+  url: string,
+  body?: unknown,
+  opts: { method?: string; trusted?: boolean } = {},
+): ReqLike {
+  const method = opts.method ?? (body !== undefined ? 'POST' : 'GET');
+  const trusted = opts.trusted ?? true;
+  const host = '127.0.0.1:3080';
+  const headers: Record<string, string> = { host };
+  if (trusted) {
+    headers['x-dsh-workspace-studio'] = '1';
+    headers['sec-fetch-site'] = 'same-origin';
+    headers.origin = `http://${host}`;
+  }
+  const req: ReqLike = { url, method, headers, socket: { remoteAddress: '127.0.0.1' } };
   if (body !== undefined) {
     const json = JSON.stringify(body);
     req.on = (ev, cb) => {
@@ -106,87 +133,88 @@ function makeReq(url: string, body?: unknown): ReqLike {
 
 const FILE = '/work/main.cpp';
 
-test('routes: /ws-studio/tree 返回文件树 JSON', async () => {
+test('routes: /api/dsh-workspace-studio/tree 返回文件树 JSON', async () => {
   const h = makeHarness();
   h.fs.addDir('/work');
   h.fs.addFile(`${FILE}`, 'x');
   h.fs.addDir('/work/node_modules');
   const res = makeRes();
-  await h.byPath.get('/ws-studio/tree')!(makeReq('/ws-studio/tree?root=/work'), res);
+  await h.byPath.get('/api/dsh-workspace-studio/tree')!(makeReq('/api/dsh-workspace-studio/tree?root=/work'), res);
   assert.equal(res.statusCode, 200);
   const tree = JSON.parse(res.body);
   assert.equal(tree.length, 1);
   assert.equal(tree[0].name, 'main.cpp');
 });
 
-test('routes: /ws-studio/file 返回内容 / 缺失返回 400', async () => {
+test('routes: /api/dsh-workspace-studio/file 返回内容 / 缺失返回 400', async () => {
   const h = makeHarness();
   h.fs.addFile(FILE, 'hello');
   const ok = makeRes();
-  await h.byPath.get('/ws-studio/file')!(makeReq(`/ws-studio/file?path=${FILE}`), ok);
+  await h.byPath.get('/api/dsh-workspace-studio/file')!(makeReq(`/api/dsh-workspace-studio/file?path=${FILE}`), ok);
   assert.equal(ok.statusCode, 200);
   assert.equal(JSON.parse(ok.body).content, 'hello');
   const bad = makeRes();
-  await h.byPath.get('/ws-studio/file')!(makeReq('/ws-studio/file?path=/nope'), bad);
+  await h.byPath.get('/api/dsh-workspace-studio/file')!(makeReq('/api/dsh-workspace-studio/file?path=/work/nope'), bad);
   assert.equal(bad.statusCode, 400);
 });
 
-test('routes: /ws-studio/ops 返回带 hunks 的视图', async () => {
+test('routes: /api/dsh-workspace-studio/ops 返回带 hunks 的视图', async () => {
   const h = makeHarness();
   h.ledger.add({ sessionId: 's1', filePath: FILE, before: 'a\nb', after: 'a\nX\nb', turn: 1 });
   const res = makeRes();
-  h.byPath.get('/ws-studio/ops')!(makeReq('/ws-studio/ops?session=s1'), res);
+  h.byPath.get('/api/dsh-workspace-studio/ops')!(makeReq('/api/dsh-workspace-studio/ops?session=s1'), res);
   assert.equal(res.statusCode, 200);
   const payload = JSON.parse(res.body);
   assert.equal(payload.files[0].path, FILE);
   assert.equal(payload.files[0].ops[0].hunks.length, 1);
 });
 
-test('routes: /ws-studio/revert POST hunk → 200 且文件已改', async () => {
+test('routes: /api/dsh-workspace-studio/revert POST hunk → 200 且文件已改', async () => {
   const h = makeHarness();
   h.fs.addFile(FILE, 'a\nX\nb');
   h.ledger.add({ sessionId: 's1', filePath: FILE, before: 'a\nb', after: 'a\nX\nb', turn: 1 });
   const res = makeRes();
-  const req = makeReq('/ws-studio/revert?session=s1', { path: FILE, op: 0, hunk: 0 });
-  await h.byPath.get('/ws-studio/revert')!(req, res);
+  const req = makeReq('/api/dsh-workspace-studio/revert?session=s1', { path: FILE, op: 0, hunk: 0 });
+  await h.byPath.get('/api/dsh-workspace-studio/revert')!(req, res);
   assert.equal(res.statusCode, 200);
   assert.equal(JSON.parse(res.body).ok, true);
   assert.equal(h.fs.contentOf(FILE), 'a\nb');
 });
 
-test('routes: /ws-studio/revert POST 冲突 → 400', async () => {
+test('routes: /api/dsh-workspace-studio/revert POST 冲突 → 400', async () => {
   const h = makeHarness();
   h.fs.addFile(FILE, 'a\nY\nb'); // X 被改
   h.ledger.add({ sessionId: 's1', filePath: FILE, before: 'a\nb', after: 'a\nX\nb', turn: 1 });
   const res = makeRes();
-  const req = makeReq('/ws-studio/revert?session=s1', { path: FILE, op: 0, hunk: 0 });
-  await h.byPath.get('/ws-studio/revert')!(req, res);
+  const req = makeReq('/api/dsh-workspace-studio/revert?session=s1', { path: FILE, op: 0, hunk: 0 });
+  await h.byPath.get('/api/dsh-workspace-studio/revert')!(req, res);
   assert.equal(res.statusCode, 400);
 });
 
-test('routes: /ws-studio/revert POST 不带 hunk → 整文件撤回', async () => {
+test('routes: /api/dsh-workspace-studio/revert POST 不带 hunk → 整文件撤回', async () => {
   const h = makeHarness();
   h.fs.addFile(FILE, 'a\nX\nb');
   h.ledger.add({ sessionId: 's1', filePath: FILE, before: 'a\nb', after: 'a\nX\nb', turn: 1 });
   const res = makeRes();
-  const req = makeReq('/ws-studio/revert?session=s1', { path: FILE });
-  await h.byPath.get('/ws-studio/revert')!(req, res);
+  const req = makeReq('/api/dsh-workspace-studio/revert?session=s1', { path: FILE });
+  await h.byPath.get('/api/dsh-workspace-studio/revert')!(req, res);
   assert.equal(res.statusCode, 200);
   assert.equal(h.fs.contentOf(FILE), 'a\nb');
 });
 
-test('routes: /ws-studio/events SSE 注册 + 变更广播', async () => {
+test('routes: /api/dsh-workspace-studio/events SSE 注册 + 变更广播', async () => {
   const h = makeHarness();
   const res = makeRes();
-  const handler = h.byPath.get('/ws-studio/events')!;
-  handler(makeReq('/ws-studio/events'), res);
+  const handler = h.byPath.get('/api/dsh-workspace-studio/events')!;
+  handler(makeReq('/api/dsh-workspace-studio/events'), res);
   assert.equal(res.headers['Content-Type'], 'text/event-stream');
   assert.match(res.body, /retry: 3000/);
   h.service.notifyChanged('s1');
-  assert.match(res.body, /data: \{"session":"s1"\}/);
+  // 契约 §2：载荷只表示"有变化"，不再回传 sessionId（客户端自己刷新当前会话）
+  assert.match(res.body, /data: \{"changed":true\}/);
 });
 
-test('routes: /ws-studio/context 返回会话 cwd', async () => {
+test('routes: /api/dsh-workspace-studio/context 返回会话 cwd', async () => {
   const h = makeHarness();
   // 给 service 注入 sessionCwd
   const svc = new WsStudioService({
@@ -195,18 +223,136 @@ test('routes: /ws-studio/context 返回会话 cwd', async () => {
     sessionCwd: (sid) => (sid === 's1' ? '/work' : undefined),
   });
   const routes2: Route[] = [];
-  registerRoutes(svc, { register: (r) => routes2.push(r as Route) });
+  registerRoutes(svc, { register: (r) => routes2.push(r as Route) }, {
+    workspaceRoots: () => ['/work'],
+    sessionCwd: (sid) => (sid === 's1' ? '/work' : undefined),
+  });
   const res = makeRes();
-  await routes2.find((r) => r.path === '/ws-studio/context')!.handler(makeReq('/ws-studio/context?session=s1'), res);
+  await routes2.find((r) => r.path === '/api/dsh-workspace-studio/context')!.handler(makeReq('/api/dsh-workspace-studio/context?session=s1'), res);
   assert.equal(res.statusCode, 200);
   assert.equal(JSON.parse(res.body).cwd, '/work');
 });
 
-test('routes: /ws-studio/clear 清空会话', async () => {
+test('routes: /api/dsh-workspace-studio/clear 清空会话', async () => {
   const h = makeHarness();
   h.ledger.add({ sessionId: 's1', filePath: FILE, before: 'a', after: 'b', turn: 1 });
   const res = makeRes();
-  h.byPath.get('/ws-studio/clear')!(makeReq('/ws-studio/clear?session=s1'), res);
+  h.byPath.get('/api/dsh-workspace-studio/clear')!(
+    makeReq('/api/dsh-workspace-studio/clear?session=s1', undefined, { method: 'POST' }),
+    res,
+  );
   assert.equal(res.statusCode, 200);
   assert.equal(h.ledger.all().length, 0);
+});
+
+// ── 安全边界：写操作信任判定 + 工作区路径授权 ────────────────────────
+
+test('routes.security: 缺少信任头的撤回请求 → 403 且不动文件', async () => {
+  const h = makeHarness();
+  h.fs.addFile(FILE, 'a\nX\nb');
+  h.ledger.add({ sessionId: 's1', filePath: FILE, before: 'a\nb', after: 'a\nX\nb', turn: 1 });
+  const res = makeRes();
+  const req = makeReq(
+    '/api/dsh-workspace-studio/revert?session=s1',
+    { path: FILE, op: 0, hunk: 0 },
+    { trusted: false },
+  );
+  await h.byPath.get('/api/dsh-workspace-studio/revert')!(req, res);
+  assert.equal(res.statusCode, 403);
+  assert.equal(h.fs.contentOf(FILE), 'a\nX\nb', '被拒的请求不得改写文件');
+});
+
+test('routes.security: 跨站 Origin 即使带信任头也 → 403', async () => {
+  const h = makeHarness();
+  h.fs.addFile(FILE, 'a\nX\nb');
+  h.ledger.add({ sessionId: 's1', filePath: FILE, before: 'a\nb', after: 'a\nX\nb', turn: 1 });
+  const req = makeReq('/api/dsh-workspace-studio/revert?session=s1', { path: FILE });
+  req.headers = { ...(req.headers ?? {}), origin: 'http://evil.example' };
+  const res = makeRes();
+  await h.byPath.get('/api/dsh-workspace-studio/revert')!(req, res);
+  assert.equal(res.statusCode, 403);
+  assert.equal(h.fs.contentOf(FILE), 'a\nX\nb');
+});
+
+test('routes.security: 非回环对端地址 → 403', async () => {
+  const h = makeHarness();
+  h.fs.addFile(FILE, 'a\nX\nb');
+  h.ledger.add({ sessionId: 's1', filePath: FILE, before: 'a\nb', after: 'a\nX\nb', turn: 1 });
+  const req = makeReq('/api/dsh-workspace-studio/revert?session=s1', { path: FILE });
+  req.socket = { remoteAddress: '10.0.0.9' };
+  const res = makeRes();
+  await h.byPath.get('/api/dsh-workspace-studio/revert')!(req, res);
+  assert.equal(res.statusCode, 403);
+  assert.equal(h.fs.contentOf(FILE), 'a\nX\nb');
+});
+
+test('routes.security: 工作区之外的 root 读取 → 403，路径穿越同样被拒', async () => {
+  const h = makeHarness();
+  const outside = makeRes();
+  await h.byPath.get('/api/dsh-workspace-studio/tree')!(
+    makeReq('/api/dsh-workspace-studio/tree?root=/etc'),
+    outside,
+  );
+  assert.equal(outside.statusCode, 403);
+
+  const traversal = makeRes();
+  await h.byPath.get('/api/dsh-workspace-studio/tree')!(
+    makeReq('/api/dsh-workspace-studio/tree?root=/work/../etc'),
+    traversal,
+  );
+  assert.equal(traversal.statusCode, 403, '../ 归一化后落在工作区外，必须拒绝');
+});
+
+test('routes.security: 工作区之外的 file 读取 → 403', async () => {
+  const h = makeHarness();
+  const res = makeRes();
+  await h.byPath.get('/api/dsh-workspace-studio/file')!(
+    makeReq('/api/dsh-workspace-studio/file?path=/etc/passwd'),
+    res,
+  );
+  assert.equal(res.statusCode, 403);
+});
+
+test('routes.security: 写操作必须是 POST（GET → 405）', async () => {
+  const h = makeHarness();
+  h.fs.addFile(FILE, 'a\nX\nb');
+  h.ledger.add({ sessionId: 's1', filePath: FILE, before: 'a\nb', after: 'a\nX\nb', turn: 1 });
+  const res = makeRes();
+  const req = makeReq('/api/dsh-workspace-studio/revert?session=s1', { path: FILE }, { method: 'GET' });
+  await h.byPath.get('/api/dsh-workspace-studio/revert')!(req, res);
+  assert.equal(res.statusCode, 405);
+  assert.equal(h.fs.contentOf(FILE), 'a\nX\nb');
+});
+
+test('routes.security: 清空台账同样要求信任请求', async () => {
+  const h = makeHarness();
+  h.ledger.add({ sessionId: 's1', filePath: FILE, before: 'a', after: 'b', turn: 1 });
+  const res = makeRes();
+  h.byPath.get('/api/dsh-workspace-studio/clear')!(
+    makeReq('/api/dsh-workspace-studio/clear?session=s1', undefined, { method: 'POST', trusted: false }),
+    res,
+  );
+  assert.equal(res.statusCode, 403);
+  assert.equal(h.ledger.all().length, 1, '未信任的清空请求不得删除记录');
+});
+
+test('routes: /api/dsh-workspace-studio/accept-all 需要信任请求，且能一次认可', async () => {
+  const h = makeHarness();
+  h.fs.addFile(FILE, 'a\nX\nb');
+  h.ledger.add({ sessionId: 's1', filePath: FILE, before: 'a\nb', after: 'a\nX\nb', turn: 1 });
+
+  const denied = makeRes();
+  await h.byPath.get('/api/dsh-workspace-studio/accept-all')!(
+    makeReq('/api/dsh-workspace-studio/accept-all?session=s1', { path: FILE }, { trusted: false }),
+    denied,
+  );
+  assert.equal(denied.statusCode, 403);
+
+  const ok = makeRes();
+  await h.byPath.get('/api/dsh-workspace-studio/accept-all')!(
+    makeReq('/api/dsh-workspace-studio/accept-all?session=s1', { path: FILE }),
+    ok,
+  );
+  assert.equal(ok.statusCode, 200);
+  assert.equal(JSON.parse(ok.body).ok, true);
 });

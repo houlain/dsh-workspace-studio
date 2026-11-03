@@ -2,7 +2,7 @@
 // 构建后由 __ModuleLoader__ 装载；React 由 DSH shell 提供。
 
 import * as React from 'react';
-import { StudioTabLabel, StudioView } from './view.ts';
+import { StudioView } from './view.ts';
 
 export const inject = ['slots'];
 
@@ -14,6 +14,43 @@ interface SlotsLike {
 interface CtxLike {
   effect(fn: () => (() => void) | void, label?: string): unknown;
   slots: SlotsLike;
+}
+
+/**
+ * 槽位错误边界。
+ *
+ * 宿主的会话标签栏没有为插件视图兜底：一个插件组件抛错会把**整条标签栏**渲染成空白
+ * （Studio 标签没了，其它标签也一起没了）。所以这里像 crossfire 那样自己包一层边界，
+ * 只让本插件的视图降级，不影响宿主和其它插件。
+ */
+class SlotBoundary extends React.Component<{ children?: unknown }, { failed: boolean }> {
+  static getDerivedStateFromError(): { failed: boolean } {
+    return { failed: true };
+  }
+
+  constructor(props: { children?: unknown }) {
+    super(props);
+    this.state = { failed: false };
+  }
+
+  render(): unknown {
+    if (this.state.failed) {
+      return React.createElement(
+        'div',
+        { className: 'wss-empty' },
+        'Studio 渲染失败（插件已隔离，不影响其它标签）。请把日志反馈给插件作者。',
+      );
+    }
+    return this.props.children;
+  }
+}
+
+/** 注册时统一套上边界。 */
+function withSlotBoundary(Inner: (props: { sessionId?: string }) => unknown) {
+  const Wrapped = (props: { sessionId?: string }) =>
+    React.createElement(SlotBoundary, null, React.createElement(Inner, props));
+  Wrapped.displayName = 'WorkspaceStudioBoundary';
+  return Wrapped;
 }
 
 const CSS = `
@@ -84,8 +121,15 @@ export function apply(ctx: CtxLike): void {
   }, 'ws-studio: styles');
   ctx.slots.inject('conversation.view', () =>
     ctx.slots.register(
-      { name: 'conversation.view', id: 'studio', order: 6, label: () => React.createElement(StudioTabLabel, null) },
-      (props) => React.createElement(StudioView, props),
+      {
+        name: 'conversation.view',
+        id: 'studio',
+        order: 6,
+        // label 必须是**字符串**：返回 React 元素会让宿主标签栏渲染失败（实测会把整条
+        // 标签栏渲染成空白，其它标签一起消失）。对照 crossfire 的可用实现也是返回字符串。
+        label: () => 'Studio',
+      },
+      withSlotBoundary((props) => React.createElement(StudioView, props)),
     ),
   );
 }
